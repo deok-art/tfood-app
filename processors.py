@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+from datetime import date, timedelta
 from io import BytesIO, StringIO
 from typing import Callable
 
@@ -8,11 +10,49 @@ import pandas as pd
 
 
 UNKNOWN_VENDOR = "미인식"
+LOTTE_MART_VENDOR_NAME = "롯데쇼핑㈜ 롯데마트사업본부"
 
+# 이력번호 prefix + 이력사이트 제품명
+# key: 상품명에 포함된 키워드
+PRODUCT_CODE_MAP: dict[str, tuple[str, str]] = {
+    "가리비치즈진밥":    ("11586725", "베이비본죽 가리비치즈진밥 180g"),
+    "게살보리진밥":      ("11586625", "베이비본죽 게살보리진밥 180g"),
+    "닭고기버섯죽":      ("6572719",  "베이비본죽 닭고기버섯죽"),
+    "닭고기알밤진밥":    ("9916423",  "베이비본죽 닭고기알밤진밥"),
+    "닭고기애호박미역죽": ("7506320", "베이비본죽 닭고기애호박미역죽"),
+    "닭고기양송이진밥":  ("6572819",  "베이비본죽 닭고기양송이진밥"),
+    "오트밀버섯전복죽":  ("10878124", "베이비본죽 오트밀버섯전복죽 180"),
+    "전복영양진밥":      ("10878524", "베이비본죽 전복영양진밥 180"),
+    "찹쌀누룽지닭죽":    ("9916723",  "베이비본죽 찹쌀누룽지닭죽"),
+    "퀴노아미역전복죽":  ("11586525", "베이비본죽 퀴노아미역전복죽 180g"),
+    "한우과일죽":        ("7506220",  "베이비본죽 한우과일죽"),
+    "한우버섯무죽":      ("10878324", "베이비본죽 한우버섯무죽 180"),
+    "한우불고기진밥":    ("9916223",  "베이비본죽 한우불고기진밥"),
+    "한우뿌리채소죽":    ("9916523",  "베이비본죽 한우뿌리채소죽"),
+    "한우사골진밥":      ("10878624", "베이비본죽 한우사골진밥 180"),
+    "한우야채진밥":      ("6572419",  "베이비본죽 한우야채진밥"),
+    "한우참깨애호박죽":  ("6572519",  "베이비본죽 한우참깨애호박죽"),
+    "흰살생선채소죽":    ("11586425", "베이비본죽 흰살생선채소죽 180g"),
+}
+
+# 이지어드민 출고처 → 이력사이트 출고처명
+CHANNEL_NAME_MAP: dict[str, str] = {
+    "쿠팡":  "쿠팡(주)",
+    "컬리":  "주식회사 컬리",
+    "개인":  "개인",
+    "네이버": "주식회사 네이버",
+}
+
+OUTPUT_COLUMNS = [
+    "전송여부", "출고일", "정보연계일자",
+    "식품이력추적관리번호", "제품명", "출고처명", "출고수량",
+]
 
 VENDOR_ALIASES: dict[str, list[str]] = {
-    # 추후 거래처별 규칙 입력 시 여기에 파일명/첫 행 키워드를 추가합니다.
-    # 예: "sample_vendor": ["샘플거래처", "sample"],
+    "이지어드민": ["작업일자", "출고처", "작업수량"],
+    "롯데마트":   ["출고예정일자", "출고수량(개수)"],
+    "명현유통":   ["명현유통"],
+    "본에프디":   ["본에프디", "togo"],
 }
 
 
@@ -29,12 +69,148 @@ class InputRecord:
 Processor = Callable[[pd.DataFrame], pd.DataFrame]
 
 
-def _pass_through(dataframe: pd.DataFrame) -> pd.DataFrame:
-    return dataframe.copy()
+def _match_product(name: str) -> tuple[str, str] | None:
+    for keyword, info in PRODUCT_CODE_MAP.items():
+        if keyword in name:
+            return info
+    return None
+
+
+def _to_date(value: object) -> date | None:
+    try:
+        return pd.to_datetime(str(value)).date()
+    except Exception:
+        return None
+
+
+def _tracking_number(prefix: str, expiry_raw: str) -> str:
+    return prefix + expiry_raw.replace("-", "").strip()
+
+
+def _pass_through(df: pd.DataFrame) -> pd.DataFrame:
+    return df.copy()
+
+
+def _find_col(df: pd.DataFrame, *keywords: str) -> str | None:
+    for kw in keywords:
+        for col in df.columns:
+            if kw in str(col):
+                return col
+    return None
+
+
+def _process_ezadmin(df: pd.DataFrame) -> pd.DataFrame:
+    """이지어드민 출고 raw → 이력사이트 출고 등록 형식."""
+    date_col    = _find_col(df, "작업일자")
+    expiry_col  = _find_col(df, "소비기한")
+    product_col = _find_col(df, "상품명")
+    channel_col = _find_col(df, "출고처")
+    qty_col     = _find_col(df, "작업수량")
+
+    missing = [k for k, c in [("작업일자", date_col), ("소비기한", expiry_col),
+                               ("상품명", product_col), ("출고처", channel_col),
+                               ("작업수량", qty_col)] if c is None]
+    if missing:
+        raise ValueError(f"이지어드민 필수 컬럼 없음: {missing}")
+
+    rows: list[dict] = []
+    for _, row in df.iterrows():
+        ship_date = _to_date(row[date_col])
+        if ship_date is None:
+            continue  # 총합 행 등 날짜가 아닌 행 제외
+
+        product_name = str(row[product_col])
+        expiry_raw   = str(row[expiry_col]).strip()
+        channel      = str(row[channel_col]).strip()
+        qty          = row[qty_col]
+
+        link_date = ship_date + timedelta(days=7)
+        vendor_name = CHANNEL_NAME_MAP.get(channel, channel)
+
+        match = _match_product(product_name)
+        if match is None:
+            rows.append({
+                "전송여부": "⚠미인식",
+                "출고일": ship_date.isoformat(),
+                "정보연계일자": link_date.isoformat(),
+                "식품이력추적관리번호": f"[미인식] {product_name}",
+                "제품명": product_name,
+                "출고처명": vendor_name,
+                "출고수량": qty,
+            })
+            continue
+
+        prefix, official_name = match
+        rows.append({
+            "전송여부": "전송",
+            "출고일": ship_date.isoformat(),
+            "정보연계일자": link_date.isoformat(),
+            "식품이력추적관리번호": _tracking_number(prefix, expiry_raw),
+            "제품명": official_name,
+            "출고처명": vendor_name,
+            "출고수량": qty,
+        })
+
+    return pd.DataFrame(rows, columns=OUTPUT_COLUMNS) if rows else pd.DataFrame(columns=OUTPUT_COLUMNS)
+
+
+def _process_lottemart(df: pd.DataFrame) -> pd.DataFrame:
+    """롯데마트 출고 raw → 이력사이트 출고 등록 형식."""
+    date_col    = _find_col(df, "출고예정일자", "출고일자")
+    product_col = _find_col(df, "품목명")
+    expiry_col  = _find_col(df, "소비기한")
+    qty_col     = _find_col(df, "출고수량(개수)", "개수")
+
+    missing = [k for k, c in [("출고예정일자", date_col), ("품목명", product_col),
+                               ("소비기한", expiry_col), ("출고수량(개수)", qty_col)] if c is None]
+    if missing:
+        raise ValueError(f"롯데마트 필수 컬럼 없음: {missing}")
+
+    rows: list[dict] = []
+    for _, row in df.iterrows():
+        ship_date = _to_date(row[date_col])
+        if ship_date is None:
+            continue
+
+        product_name = str(row[product_col])
+        expiry_raw   = str(row[expiry_col]).strip()  # YYYYMMDD 형식 (대시 없음)
+        qty          = row[qty_col]
+
+        link_date = ship_date + timedelta(days=7)
+
+        match = _match_product(product_name)
+        if match is None:
+            rows.append({
+                "전송여부": "⚠미인식",
+                "출고일": ship_date.isoformat(),
+                "정보연계일자": link_date.isoformat(),
+                "식품이력추적관리번호": f"[미인식] {product_name}",
+                "제품명": product_name,
+                "출고처명": LOTTE_MART_VENDOR_NAME,
+                "출고수량": qty,
+            })
+            continue
+
+        prefix, official_name = match
+        rows.append({
+            "전송여부": "전송",
+            "출고일": ship_date.isoformat(),
+            "정보연계일자": link_date.isoformat(),
+            "식품이력추적관리번호": _tracking_number(prefix, expiry_raw),
+            "제품명": official_name,
+            "출고처명": LOTTE_MART_VENDOR_NAME,
+            "출고수량": qty,
+        })
+
+    return pd.DataFrame(rows, columns=OUTPUT_COLUMNS) if rows else pd.DataFrame(columns=OUTPUT_COLUMNS)
 
 
 PROCESSOR_REGISTRY: dict[str, Processor] = {
     UNKNOWN_VENDOR: _pass_through,
+    "이지어드민": _process_ezadmin,
+    "롯데마트":   _process_lottemart,
+    "명현유통":   _pass_through,
+    "본에프디":   _pass_through,
 }
 
 
@@ -49,15 +225,23 @@ def first_row_as_text(dataframe: pd.DataFrame) -> str:
     if dataframe.empty:
         return ""
     first_row = dataframe.iloc[0].fillna("").astype(str).tolist()
-    return " ".join(value.strip() for value in first_row if value.strip())
+    return " ".join(v.strip() for v in first_row if v.strip())
 
 
 def detect_vendor(source_name: str, dataframe: pd.DataFrame) -> str:
-    haystack = f"{source_name} {first_row_as_text(dataframe)}".casefold()
+    # 컬럼 헤더로 우선 감지
+    columns_text = " ".join(dataframe.columns.astype(str))
+    haystack = f"{source_name} {columns_text} {first_row_as_text(dataframe)}".casefold()
+
+    best_vendor = UNKNOWN_VENDOR
+    best_score = 0
     for vendor_id, aliases in VENDOR_ALIASES.items():
-        if any(alias.casefold() in haystack for alias in aliases):
-            return vendor_id
-    return UNKNOWN_VENDOR
+        score = sum(1 for a in aliases if a.casefold() in haystack)
+        if score > best_score:
+            best_score = score
+            best_vendor = vendor_id
+
+    return best_vendor if best_score >= 1 else UNKNOWN_VENDOR
 
 
 def read_excel_upload(uploaded_file) -> pd.DataFrame:
@@ -86,22 +270,25 @@ def build_record(source_type: str, source_name: str, dataframe: pd.DataFrame) ->
 def process_record(record: InputRecord) -> pd.DataFrame:
     processor = PROCESSOR_REGISTRY.get(record.selected_vendor, _pass_through)
     processed = processor(record.dataframe)
+    if record.selected_vendor in ("이지어드민", "롯데마트"):
+        return processed
+    # 미인식/기타 거래처는 원본 컬럼 유지 + 거래처 컬럼 추가
+    processed = processed.copy()
     processed.insert(0, "거래처", record.selected_vendor)
     processed.insert(1, "입력출처", record.source_type)
-    processed.insert(2, "원본명", record.source_name)
     return processed
 
 
 def combine_records(records: list[InputRecord]) -> pd.DataFrame:
-    processed_frames = [process_record(record) for record in records]
-    if not processed_frames:
+    frames = [process_record(r) for r in records]
+    if not frames:
         return pd.DataFrame()
-    return pd.concat(processed_frames, ignore_index=True)
+    return pd.concat(frames, ignore_index=True)
 
 
 def dataframe_to_excel_bytes(dataframe: pd.DataFrame) -> bytes:
     buffer = BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        dataframe.to_excel(writer, index=False, sheet_name="취합결과")
+        dataframe.to_excel(writer, index=False, sheet_name="출고이력등록")
     buffer.seek(0)
     return buffer.getvalue()
