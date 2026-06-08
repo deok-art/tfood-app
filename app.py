@@ -6,7 +6,6 @@ import streamlit as st
 from processors import (
     UNKNOWN_VENDOR,
     InputRecord,
-    OUTPUT_COLUMNS,
     available_vendors,
     build_record,
     combine_records,
@@ -154,21 +153,46 @@ def vendor_review(records: list[InputRecord]) -> list[InputRecord]:
     return reviewed
 
 
-def show_result_summary(df) -> None:
+def _qty_col(df: pd.DataFrame) -> str | None:
+    for name in ("작업수량", "출고수량"):
+        if name in df.columns:
+            return name
+    return None
+
+
+def show_result(df: pd.DataFrame, excel: bytes) -> None:
     if df.empty:
+        st.info("가공된 데이터가 없습니다.")
         return
 
-    total = int(df["출고수량"].apply(pd.to_numeric, errors="coerce").sum())
-    unrecognized = df[df["전송여부"].str.startswith("⚠", na=False)]
+    qty_col = _qty_col(df)
+    total = int(df[qty_col].apply(pd.to_numeric, errors="coerce").sum()) if qty_col else 0
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2 = st.columns(2)
     col1.metric("총 행 수", len(df))
-    col2.metric("출고수량 합계", f"{total:,}")
-    col3.metric("미인식 행", len(unrecognized), delta_color="inverse")
+    col2.metric("수량 합계", f"{total:,}")
 
-    if not unrecognized.empty:
-        st.warning("인식 못 한 상품이 있습니다. 제품 코드 맵을 업데이트하세요.")
-        st.dataframe(unrecognized, use_container_width=True)
+    # 합계 행을 마지막에 붙여서 표시
+    display_df = df.copy()
+    if qty_col:
+        total_row: dict = {c: "" for c in display_df.columns}
+        total_row[qty_col] = total
+        if "작업일자" in total_row:
+            total_row["작업일자"] = "합계"
+        elif "출고일" in total_row:
+            total_row["출고일"] = "합계"
+        display_df = pd.concat(
+            [display_df, pd.DataFrame([total_row])], ignore_index=True
+        )
+
+    st.dataframe(display_df, use_container_width=True, height=420)
+    st.download_button(
+        "⬇ 엑셀 다운로드",
+        data=excel,
+        file_name="출고취합.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
 
 
 def main() -> None:
@@ -198,15 +222,7 @@ def main() -> None:
 
     if df is not None and excel is not None:
         st.subheader("가공 결과")
-        show_result_summary(df)
-        st.dataframe(df, use_container_width=True, height=400)
-        st.download_button(
-            "⬇ 엑셀 다운로드 (이력사이트 등록용)",
-            data=excel,
-            file_name="출고이력등록.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
+        show_result(df, excel)
 
 
 if __name__ == "__main__":

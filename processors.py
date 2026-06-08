@@ -53,6 +53,17 @@ OUTPUT_COLUMNS = [
     "식품이력추적관리번호", "제품명", "출고처명", "출고수량",
 ]
 
+# 이지어드민 중간 검토 형식 컬럼
+REVIEW_COLUMNS = ["작업일자", "소비기한", "상품명", "출고처", "작업수량"]
+
+# 이지어드민 짧은 채널명 → 이력사이트 공식 거래처명 (이력사이트 등록 시 사용)
+CHANNEL_FULL_NAME: dict[str, str] = {
+    "컬리":  "주식회사 컬리",
+    "쿠팡":  "쿠팡(주)",
+    "네이버": "주식회사 네이버",
+    "개인":  "개인",
+}
+
 VENDOR_ALIASES: dict[str, list[str]] = {
     "이지어드민": ["작업일자", "작업수량", "메모"],
     "롯데마트":   ["출고예정일자", "출고수량(개수)"],
@@ -105,38 +116,39 @@ def _find_col(df: pd.DataFrame, *keywords: str) -> str | None:
 
 
 def _parse_channel_from_memo(memo: str) -> str:
-    """메모 컬럼에서 출고 채널명을 추출한다.
+    """메모 컬럼에서 출고 채널명(짧은 이름)을 추출한다.
 
     규칙:
-      '컬리출하_XXXXXX' → 주식회사 컬리
-      '쿠팡출하_XXXXXX' → 쿠팡(주)
-      '네이버출하_XXXXXX' → 주식회사 네이버
+      '컬리출하_XXXXXX' → 컬리
+      '쿠팡출하_XXXXXX' → 쿠팡
+      '네이버출하_XXXXXX' → 네이버
       그 외(ezpos, 송장출력 배송처리, cs 배송처리 …) → 개인
     """
     m = memo.strip()
     if "컬리출하" in m:
-        return "주식회사 컬리"
+        return "컬리"
     if "쿠팡출하" in m:
-        return "쿠팡(주)"
+        return "쿠팡"
     if "네이버출하" in m:
-        return "주식회사 네이버"
+        return "네이버"
     return "개인"
 
 
 def _process_ezadmin(df: pd.DataFrame) -> pd.DataFrame:
-    """이지어드민 출고 raw → 이력사이트 출고 등록 형식.
+    """이지어드민 출고 raw → 중간 검토 형식 (REVIEW_COLUMNS).
 
     실제 컬럼 구조 (17개):
       작업일자 / 입고일 / 제조일 / 유통기한 / 로트번호 / 제조번호 /
       로케이션 / 상품코드 / 상품명 / 옵션 / 이전재고 / 이후재고 /
       작업수량 / 작업 / 현재고(평치+일반) / 메모 / 바코드
 
-    출고처는 '출고처' 컬럼이 아닌 '메모' 컬럼에 인코딩되어 있음.
+    출고처는 '메모' 컬럼에 인코딩되어 있음.
+    집계: (소비기한, 상품명, 출고처) 동일 조합의 수량 합산.
     """
     date_col    = _find_col(df, "작업일자")
     expiry_col  = _find_col(df, "유통기한")
     product_col = _find_col(df, "상품명")
-    # "작업" 컬럼은 정확히 일치하는 것을 찾아야 함 — 작업일자·작업수량과 구분
+    # "작업" 컬럼 exact match — 작업일자·작업수량과 구분
     type_col    = next((c for c in df.columns if str(c).strip() == "작업"), None)
     memo_col    = _find_col(df, "메모")
     qty_col     = _find_col(df, "작업수량")
@@ -151,17 +163,17 @@ def _process_ezadmin(df: pd.DataFrame) -> pd.DataFrame:
 
     # 입고 제외 → 배송·출고만 처리
     df = df[df[type_col].astype(str).isin(["배송", "출고"])].copy()
-    # '직납' 상품 제외 (별도 카테고리, 재고 음수 등)
+    # '직납' 상품 제외
     df = df[~df[product_col].astype(str).str.contains("직납", na=False)].copy()
 
     rows: list[dict] = []
     for _, row in df.iterrows():
-        # 작업일자에 시간이 붙어 있으므로 날짜 부분만 사용 ("2026-05-28 18:23" → "2026-05-28")
-        ship_date = _to_date(str(row[date_col]).split()[0])
-        if ship_date is None:
+        try:
+            dt = pd.to_datetime(str(row[date_col]).strip())
+        except Exception:
             continue
 
-        product_name = str(row[product_col])
+        product_name = str(row[product_col]).strip()
         expiry_raw   = str(row[expiry_col]).strip()  # YYYY-MM-DD
         memo         = str(row[memo_col]).strip()
         try:
@@ -171,59 +183,31 @@ def _process_ezadmin(df: pd.DataFrame) -> pd.DataFrame:
         if qty <= 0:
             continue
 
-        link_date   = ship_date + timedelta(days=7)
-        vendor_name = _parse_channel_from_memo(memo)
-
-        match = _match_product(product_name)
-        if match is None:
-            rows.append({
-                "전송여부": "⚠미인식",
-                "출고일": ship_date.isoformat(),
-                "정보연계일자": link_date.isoformat(),
-                "식품이력추적관리번호": f"[미인식] {product_name}",
-                "제품명": product_name,
-                "출고처명": vendor_name,
-                "출고수량": qty,
-            })
-            continue
-
-        prefix, official_name = match
-        if not prefix:
-            # 신규 제품 — prefix 미등록 상태
-            rows.append({
-                "전송여부": "⚠이력번호미등록",
-                "출고일": ship_date.isoformat(),
-                "정보연계일자": link_date.isoformat(),
-                "식품이력추적관리번호": f"[prefix없음] {official_name}",
-                "제품명": official_name,
-                "출고처명": vendor_name,
-                "출고수량": qty,
-            })
-            continue
-
         rows.append({
-            "전송여부": "전송",
-            "출고일": ship_date.isoformat(),
-            "정보연계일자": link_date.isoformat(),
-            "식품이력추적관리번호": _tracking_number(prefix, expiry_raw),
-            "제품명": official_name,
-            "출고처명": vendor_name,
-            "출고수량": qty,
+            "작업일자": dt,
+            "소비기한": expiry_raw,
+            "상품명": product_name,
+            "출고처": _parse_channel_from_memo(memo),
+            "작업수량": qty,
         })
 
     if not rows:
-        return pd.DataFrame(columns=OUTPUT_COLUMNS)
+        return pd.DataFrame(columns=REVIEW_COLUMNS)
 
     result = pd.DataFrame(rows)
+    result["작업수량"] = pd.to_numeric(result["작업수량"], errors="coerce").fillna(0).astype(int)
 
-    # 동일 (출고일, 이력번호, 제품명, 출고처) 합산 — 복수 박스 스캔 집계
-    key_cols = ["출고일", "정보연계일자", "식품이력추적관리번호", "제품명", "출고처명"]
+    # (소비기한, 상품명, 출고처) 동일 조합 합산 — 복수 박스 스캔 집계
     agg = (
         result
-        .groupby(key_cols, sort=False, as_index=False)
-        .agg(전송여부=("전송여부", "first"), 출고수량=("출고수량", "sum"))
+        .groupby(["소비기한", "상품명", "출고처"], sort=False, as_index=False)
+        .agg(작업일자=("작업일자", "max"), 작업수량=("작업수량", "sum"))
     )
-    return agg[OUTPUT_COLUMNS]
+    # 작업일자 HH:MM 표시 (초 생략)
+    agg["작업일자"] = agg["작업일자"].dt.strftime("%Y-%m-%d %H:%M")
+
+    agg = agg.sort_values(["상품명", "소비기한", "출고처"]).reset_index(drop=True)
+    return agg[REVIEW_COLUMNS]
 
 
 def _process_lottemart(df: pd.DataFrame) -> pd.DataFrame:
