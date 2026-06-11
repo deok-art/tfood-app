@@ -520,6 +520,25 @@ def _styled_review_excel(df: pd.DataFrame) -> bytes:
     return buffer.getvalue()
 
 
+def _extract_mmdd(dataframe: pd.DataFrame) -> str:
+    """데이터의 작업일자/출고일에서 MMDD 추출. 실패 시 오늘 날짜."""
+    for col in ("작업일자", "출고일"):
+        if col in dataframe.columns and not dataframe.empty:
+            try:
+                return pd.to_datetime(str(dataframe[col].iloc[0])).strftime("%m%d")
+            except Exception:
+                continue
+    return date.today().strftime("%m%d")
+
+
+def build_export_filename(dataframe: pd.DataFrame) -> str:
+    """다운로드 파일명 생성. 이지어드민 검토 형식이면 '이지어드민 출고현황 MMDD.xlsx'."""
+    mmdd = _extract_mmdd(dataframe)
+    if list(dataframe.columns) == REVIEW_COLUMNS:
+        return f"이지어드민 출고현황 {mmdd}.xlsx"
+    return f"출고취합 {mmdd}.xlsx"
+
+
 def dataframe_to_excel_bytes(dataframe: pd.DataFrame) -> bytes:
     # 이지어드민 중간 검토 형식이면 색상 구분 엑셀로 출력
     if list(dataframe.columns) == REVIEW_COLUMNS:

@@ -7,6 +7,7 @@ from processors import (
     UNKNOWN_VENDOR,
     InputRecord,
     available_vendors,
+    build_export_filename,
     build_record,
     combine_records,
     dataframe_to_excel_bytes,
@@ -22,81 +23,25 @@ def read_inputs() -> list[InputRecord]:
     records: list[InputRecord] = []
 
     st.subheader("데이터 입력")
-    col_left, col_right = st.columns(2)
 
-    with col_left:
-        st.markdown("**📋 이지어드민 출고 붙여넣기**")
-        ezadmin_text = st.text_area(
-            "이지어드민",
-            height=220,
-            placeholder="이지어드민 출고 내역을 엑셀에서 복사 후 붙여넣기",
-            label_visibility="collapsed",
-            key="ezadmin_paste",
-        )
-        if ezadmin_text.strip():
-            try:
-                df = read_clipboard_table(ezadmin_text)
-                if not df.empty:
-                    records.append(build_record("붙여넣기", "이지어드민", df))
-                    st.success(f"이지어드민: {len(df)}행 인식")
-            except Exception as exc:
-                st.error(f"이지어드민 읽기 실패: {exc}")
+    st.markdown("**📋 이지어드민 출고 붙여넣기**")
+    ezadmin_text = st.text_area(
+        "이지어드민",
+        height=260,
+        placeholder="이지어드민 출고 내역을 엑셀에서 복사 후 붙여넣기",
+        label_visibility="collapsed",
+        key="ezadmin_paste",
+    )
+    if ezadmin_text.strip():
+        try:
+            df = read_clipboard_table(ezadmin_text)
+            if not df.empty:
+                records.append(build_record("붙여넣기", "이지어드민", df))
+                st.success(f"이지어드민: {len(df)}행 인식")
+        except Exception as exc:
+            st.error(f"이지어드민 읽기 실패: {exc}")
 
-    with col_right:
-        st.markdown("**📋 롯데마트 출고 붙여넣기**")
-        lotte_text = st.text_area(
-            "롯데마트",
-            height=220,
-            placeholder="롯데마트 출고 내역을 엑셀에서 복사 후 붙여넣기",
-            label_visibility="collapsed",
-            key="lotte_paste",
-        )
-        if lotte_text.strip():
-            try:
-                df = read_clipboard_table(lotte_text)
-                if not df.empty:
-                    records.append(build_record("붙여넣기", "롯데마트", df))
-                    st.success(f"롯데마트: {len(df)}행 인식")
-            except Exception as exc:
-                st.error(f"롯데마트 읽기 실패: {exc}")
-
-    col3, col4 = st.columns(2)
-
-    with col3:
-        st.markdown("**📋 명현유통 출고 붙여넣기**")
-        myunghyun_text = st.text_area(
-            "명현유통",
-            height=120,
-            placeholder="명현유통 출고 내역 (없으면 비워두세요)",
-            label_visibility="collapsed",
-            key="myunghyun_paste",
-        )
-        if myunghyun_text.strip():
-            try:
-                df = read_clipboard_table(myunghyun_text)
-                if not df.empty:
-                    records.append(build_record("붙여넣기", "명현유통", df))
-                    st.success(f"명현유통: {len(df)}행 인식")
-            except Exception as exc:
-                st.error(f"명현유통 읽기 실패: {exc}")
-
-    with col4:
-        st.markdown("**📋 본에프디 출고 붙여넣기**")
-        bonfd_text = st.text_area(
-            "본에프디",
-            height=120,
-            placeholder="본에프디 출고 내역 (없으면 비워두세요)",
-            label_visibility="collapsed",
-            key="bonfd_paste",
-        )
-        if bonfd_text.strip():
-            try:
-                df = read_clipboard_table(bonfd_text)
-                if not df.empty:
-                    records.append(build_record("붙여넣기", "본에프디", df))
-                    st.success(f"본에프디: {len(df)}행 인식")
-            except Exception as exc:
-                st.error(f"본에프디 읽기 실패: {exc}")
+    # 롯데마트 / 명현유통 / 본에프디 붙여넣기는 추후 구현 — 현재 숨김
 
     with st.expander("엑셀 파일 직접 업로드", expanded=False):
         uploaded_files = st.file_uploader(
@@ -189,7 +134,7 @@ def show_result(df: pd.DataFrame, excel: bytes) -> None:
     st.download_button(
         "⬇ 엑셀 다운로드",
         data=excel,
-        file_name="출고취합.xlsx",
+        file_name=build_export_filename(df),
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
