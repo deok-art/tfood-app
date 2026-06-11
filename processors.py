@@ -7,6 +7,9 @@ from io import BytesIO, StringIO
 from typing import Callable
 
 import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
 
 
 UNKNOWN_VENDOR = "미인식"
@@ -86,8 +89,9 @@ Processor = Callable[[pd.DataFrame], pd.DataFrame]
 
 
 def _match_product(name: str) -> tuple[str, str] | None:
+    cleaned_name = str(name).replace(" ", "")
     for keyword, info in PRODUCT_CODE_MAP.items():
-        if keyword in name:
+        if keyword.replace(" ", "") in cleaned_name:
             return info
     return None
 
@@ -163,8 +167,8 @@ def _process_ezadmin(df: pd.DataFrame) -> pd.DataFrame:
 
     # 입고 제외 → 배송·출고만 처리
     df = df[df[type_col].astype(str).isin(["배송", "출고"])].copy()
-    # '직납' 상품 제외
-    df = df[~df[product_col].astype(str).str.contains("직납", na=False)].copy()
+    # '직납', '영양밥' 상품 제외
+    df = df[~df[product_col].astype(str).str.contains("직납|영양밥", na=False, regex=True)].copy()
 
     rows: list[dict] = []
     for _, row in df.iterrows():
@@ -177,7 +181,8 @@ def _process_ezadmin(df: pd.DataFrame) -> pd.DataFrame:
         expiry_raw   = str(row[expiry_col]).strip()  # YYYY-MM-DD
         memo         = str(row[memo_col]).strip()
         try:
-            qty = int(float(str(row[qty_col])))
+            qty_str = str(row[qty_col]).replace(",", "").strip()
+            qty = int(float(qty_str))
         except (ValueError, TypeError):
             continue
         if qty <= 0:
@@ -229,6 +234,8 @@ def _process_lottemart(df: pd.DataFrame) -> pd.DataFrame:
             continue
 
         product_name = str(row[product_col])
+        if "영양밥" in product_name:
+            continue
         expiry_raw   = str(row[expiry_col]).strip()  # YYYYMMDD 형식 (대시 없음)
         qty          = row[qty_col]
 
@@ -342,7 +349,182 @@ def combine_records(records: list[InputRecord]) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
+# ── 엑셀 스타일 팔레트 (RRGGBB) ──────────────────────────────────────
+_HEADER_FILL = "1F4E2C"   # 딥그린 — 헤더·합계 배경
+_HEADER_FONT = "FFFFFF"   # 흰색 글씨
+_GROUP_FILL_A = "FFFFFF"  # 상품 그룹 zebra — 밝은 행
+_GROUP_FILL_B = "EDF4EF"  # 상품 그룹 zebra — 연그린 행
+_BORDER_COLOR = "D9D9D9"  # 얇은 회색 테두리
+_EXPIRY_FILL = "FFF2CC"   # 연주황 — 소비기한 다중 상품 강조 배경
+_EXPIRY_FONT = "9C6500"   # 진한 주황 — 소비기한 다중 상품 글씨
+_EXPIRY_BORDER = "BF8F00"  # 골드 — 같은 상품 내 소비기한 경계 구분선
+
+# 출고처별 (배경, 글씨) — 채널 브랜드 톤
+_CHANNEL_STYLE: dict[str, tuple[str, str]] = {
+    "개인":  ("ECECEC", "595959"),  # 회색
+    "컬리":  ("E7DCF2", "7030A0"),  # 컬리 퍼플
+    "쿠팡":  ("FCE0E0", "C00000"),  # 쿠팡 레드
+    "네이버": ("DCEFE0", "1E7B34"),  # 네이버 그린
+}
+
+# 컬럼별 너비·정렬 (컬럼명: (너비, 가운데정렬여부))
+_COLUMN_LAYOUT: dict[str, tuple[int, bool]] = {
+    "작업일자": (18, True),
+    "소비기한": (13, True),
+    "상품명":   (30, False),
+    "출고처":   (10, True),
+    "작업수량": (11, True),
+}
+
+
+def _thin_border() -> Border:
+    side = Side(style="thin", color=_BORDER_COLOR)
+    return Border(left=side, right=side, top=side, bottom=side)
+
+
+def _styled_review_excel(df: pd.DataFrame) -> bytes:
+    """이지어드민 중간 검토 형식(REVIEW_COLUMNS)을 색상 구분된 엑셀로 변환.
+
+    - 헤더: 딥그린 배경 + 흰 볼드, 틀 고정
+    - 출고처: 채널별 고유 색
+    - 상품명: 같은 상품 그룹끼리 교대 음영(zebra)
+    - 합계 행: 딥그린 강조
+    """
+    columns = list(df.columns)
+    border = _thin_border()
+    center = Alignment(horizontal="center", vertical="center")
+    left = Alignment(horizontal="left", vertical="center")
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "이지어드민 출고검토"
+
+    # ── 헤더 행 ──
+    header_fill = PatternFill("solid", fgColor=_HEADER_FILL)
+    header_font = Font(color=_HEADER_FONT, bold=True, size=11)
+    ws.append(columns)
+    for col_idx, name in enumerate(columns, 1):
+        cell = ws.cell(row=1, column=col_idx)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = center
+        cell.border = border
+    ws.row_dimensions[1].height = 24
+
+    # ── 데이터 행 (상품 그룹 zebra + 소비기한 구분) ──
+    qty_idx = columns.index("작업수량") + 1 if "작업수량" in columns else None
+    product_idx = columns.index("상품명") if "상품명" in columns else None
+    channel_idx = columns.index("출고처") if "출고처" in columns else None
+    expiry_idx = columns.index("소비기한") if "소비기한" in columns else None
+
+    # 상품별 고유 소비기한 개수 → 2개 이상이면 소비기한 셀 강조
+    expiry_count: dict[str, int] = {}
+    if product_idx is not None and expiry_idx is not None:
+        expiry_count = (
+            df.groupby(columns[product_idx])[columns[expiry_idx]].nunique().to_dict()
+        )
+    boundary_side = Side(style="medium", color=_EXPIRY_BORDER)
+    expiry_fill = PatternFill("solid", fgColor=_EXPIRY_FILL)
+    expiry_font = Font(color=_EXPIRY_FONT, bold=True)
+
+    prev_product: str | None = None
+    prev_expiry: str | None = None
+    group_toggle = False
+    excel_row = 2
+    for _, record in df.iterrows():
+        values = [record[c] for c in columns]
+        current_product = str(values[product_idx]) if product_idx is not None else None
+        current_expiry = str(values[expiry_idx]) if expiry_idx is not None else None
+
+        # 상품명이 바뀌면 음영 토글 → 같은 상품 그룹은 동일 배경
+        is_new_product = current_product != prev_product
+        if is_new_product:
+            group_toggle = not group_toggle
+        # 같은 상품인데 소비기한만 바뀌는 경계 행 → 윗변 굵은 구분선
+        is_expiry_boundary = (
+            not is_new_product
+            and current_expiry is not None
+            and current_expiry != prev_expiry
+        )
+
+        group_fill = PatternFill(
+            "solid", fgColor=_GROUP_FILL_B if group_toggle else _GROUP_FILL_A
+        )
+        row_border = border
+        if is_expiry_boundary:
+            row_border = Border(
+                left=border.left, right=border.right,
+                top=boundary_side, bottom=border.bottom,
+            )
+
+        ws.append(values)
+        for col_idx, name in enumerate(columns, 1):
+            cell = ws.cell(row=excel_row, column=col_idx)
+            cell.fill = group_fill
+            cell.border = row_border
+            cell.alignment = left if name == "상품명" else center
+
+        # 소비기한이 여러 개인 상품: 소비기한 셀 강조
+        if expiry_idx is not None and expiry_count.get(current_product, 0) >= 2:
+            ec = ws.cell(row=excel_row, column=expiry_idx + 1)
+            ec.fill = expiry_fill
+            ec.font = expiry_font
+
+        # 출고처 셀: 채널별 색 덮어쓰기
+        if channel_idx is not None:
+            ch = str(values[channel_idx])
+            if ch in _CHANNEL_STYLE:
+                bg, fg = _CHANNEL_STYLE[ch]
+                ch_cell = ws.cell(row=excel_row, column=channel_idx + 1)
+                ch_cell.fill = PatternFill("solid", fgColor=bg)
+                ch_cell.font = Font(color=fg, bold=True)
+
+        # 작업수량: 천단위 콤마
+        if qty_idx is not None:
+            ws.cell(row=excel_row, column=qty_idx).number_format = "#,##0"
+
+        ws.row_dimensions[excel_row].height = 18
+        prev_product = current_product
+        prev_expiry = current_expiry
+        excel_row += 1
+
+    # ── 합계 행 ──
+    total_fill = PatternFill("solid", fgColor=_HEADER_FILL)
+    total_font = Font(color=_HEADER_FONT, bold=True)
+    total_values = ["" for _ in columns]
+    if columns:
+        total_values[0] = "합계"
+    if qty_idx is not None:
+        total = pd.to_numeric(df["작업수량"], errors="coerce").fillna(0).sum()
+        total_values[qty_idx - 1] = int(total)
+    ws.append(total_values)
+    for col_idx in range(1, len(columns) + 1):
+        cell = ws.cell(row=excel_row, column=col_idx)
+        cell.fill = total_fill
+        cell.font = total_font
+        cell.alignment = center
+        cell.border = border
+    if qty_idx is not None:
+        ws.cell(row=excel_row, column=qty_idx).number_format = "#,##0"
+    ws.row_dimensions[excel_row].height = 22
+
+    # ── 열너비 · 틀 고정 ──
+    for col_idx, name in enumerate(columns, 1):
+        width, _ = _COLUMN_LAYOUT.get(name, (14, True))
+        ws.column_dimensions[get_column_letter(col_idx)].width = width
+    ws.freeze_panes = "A2"
+
+    buffer = BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
 def dataframe_to_excel_bytes(dataframe: pd.DataFrame) -> bytes:
+    # 이지어드민 중간 검토 형식이면 색상 구분 엑셀로 출력
+    if list(dataframe.columns) == REVIEW_COLUMNS:
+        return _styled_review_excel(dataframe)
+
     buffer = BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         dataframe.to_excel(writer, index=False, sheet_name="출고이력등록")
