@@ -4,6 +4,7 @@ import pandas as pd
 import streamlit as st
 
 from processors import (
+    NEEDS_REVIEW_CHANNEL,
     UNKNOWN_VENDOR,
     InputRecord,
     available_vendors,
@@ -116,6 +117,15 @@ def show_result(df: pd.DataFrame, excel: bytes) -> None:
     col1, col2 = st.columns(2)
     col1.metric("총 행 수", len(df))
     col2.metric("수량 합계", f"{total:,}")
+
+    # 휴먼터치 필요 행 경고
+    if "출고처" in df.columns:
+        review_rows = df[df["출고처"] == NEEDS_REVIEW_CHANNEL]
+        if not review_rows.empty:
+            st.warning(
+                f"⚠️ 출고처 미분류 {len(review_rows)}건 (메모 패턴 미등록). "
+                f"엑셀에서 빨강 셀 확인 후 규칙 추가 필요."
+            )
 
     # 합계 행을 마지막에 붙여서 표시
     display_df = df.copy()

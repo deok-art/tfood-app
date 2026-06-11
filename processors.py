@@ -119,23 +119,27 @@ def _find_col(df: pd.DataFrame, *keywords: str) -> str | None:
     return None
 
 
-def _parse_channel_from_memo(memo: str) -> str:
-    """메모 컬럼에서 출고 채널명(짧은 이름)을 추출한다.
+# 메모 → 출고처 규칙. 위에서부터 첫 매칭 적용.
+# 새 패턴 학습되면 여기 한 줄씩 추가. (키워드, 출고처)
+CHANNEL_MEMO_RULES: list[tuple[str, str]] = [
+    ("쿠팡출하", "쿠팡"),
+    ("컬리출하", "컬리"),
+    ("네이버출하", "네이버"),
+    ("ezpos", "개인"),
+    ("송장출력", "개인"),
+]
 
-    규칙:
-      '컬리출하_XXXXXX' → 컬리
-      '쿠팡출하_XXXXXX' → 쿠팡
-      '네이버출하_XXXXXX' → 네이버
-      그 외(ezpos, 송장출력 배송처리, cs 배송처리 …) → 개인
-    """
+# 어떤 규칙에도 안 걸린 메모 → 휴먼터치 필요
+NEEDS_REVIEW_CHANNEL = "❓확인필요"
+
+
+def _parse_channel_from_memo(memo: str) -> str:
+    """메모에서 출고처 판정. 규칙 미매칭 시 '확인필요'로 띄움(개인으로 흡수 안 함)."""
     m = memo.strip()
-    if "컬리출하" in m:
-        return "컬리"
-    if "쿠팡출하" in m:
-        return "쿠팡"
-    if "네이버출하" in m:
-        return "네이버"
-    return "개인"
+    for keyword, channel in CHANNEL_MEMO_RULES:
+        if keyword in m:
+            return channel
+    return NEEDS_REVIEW_CHANNEL
 
 
 def _process_ezadmin(df: pd.DataFrame) -> pd.DataFrame:
@@ -365,6 +369,7 @@ _CHANNEL_STYLE: dict[str, tuple[str, str]] = {
     "컬리":  ("E7DCF2", "7030A0"),  # 컬리 퍼플
     "쿠팡":  ("FCE0E0", "C00000"),  # 쿠팡 레드
     "네이버": ("DCEFE0", "1E7B34"),  # 네이버 그린
+    NEEDS_REVIEW_CHANNEL: ("FFC7CE", "9C0006"),  # 빨강 — 휴먼터치 필요
 }
 
 # 컬럼별 너비·정렬 (컬럼명: (너비, 가운데정렬여부))
