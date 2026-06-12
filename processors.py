@@ -57,7 +57,7 @@ OUTPUT_COLUMNS = [
 ]
 
 # 이지어드민 중간 검토 형식 컬럼
-REVIEW_COLUMNS = ["작업일자", "소비기한", "상품명", "출고처", "작업수량"]
+REVIEW_COLUMNS = ["작업일자", "소비기한", "상품명", "출고처", "작업수량", "비고"]
 
 # 이지어드민 짧은 채널명 → 이력사이트 공식 거래처명 (이력사이트 등록 시 사용)
 CHANNEL_FULL_NAME: dict[str, str] = {
@@ -198,6 +198,7 @@ def _process_ezadmin(df: pd.DataFrame) -> pd.DataFrame:
             "상품명": product_name,
             "출고처": _parse_channel_from_memo(memo),
             "작업수량": qty,
+            "비고": memo,
         })
 
     if not rows:
@@ -210,8 +211,11 @@ def _process_ezadmin(df: pd.DataFrame) -> pd.DataFrame:
     agg = (
         result
         .groupby(["소비기한", "상품명", "출고처"], sort=False, as_index=False)
-        .agg(작업일자=("작업일자", "max"), 작업수량=("작업수량", "sum"))
+        .agg(작업일자=("작업일자", "max"), 작업수량=("작업수량", "sum"), 비고=("비고", lambda x: " | ".join(sorted(set(x)))))
     )
+    # 확인필요가 아닌 행은 비고란을 비워 깔끔하게 표시
+    agg["비고"] = agg.apply(lambda row: row["비고"] if row["출고처"] == NEEDS_REVIEW_CHANNEL else "", axis=1)
+
     # 작업일자 HH:MM 표시 (초 생략)
     agg["작업일자"] = agg["작업일자"].dt.strftime("%Y-%m-%d %H:%M")
 
@@ -379,6 +383,7 @@ _COLUMN_LAYOUT: dict[str, tuple[int, bool]] = {
     "상품명":   (30, False),
     "출고처":   (10, True),
     "작업수량": (11, True),
+    "비고":    (40, False),
 }
 
 
@@ -500,8 +505,11 @@ def _styled_review_excel(df: pd.DataFrame) -> bytes:
     if columns:
         total_values[0] = "합계"
     if qty_idx is not None:
-        total = pd.to_numeric(df["작업수량"], errors="coerce").fillna(0).sum()
-        total_values[qty_idx - 1] = int(total)
+        col_letter = get_column_letter(qty_idx)
+        if excel_row > 2:
+            total_values[qty_idx - 1] = f"=SUM({col_letter}2:{col_letter}{excel_row-1})"
+        else:
+            total_values[qty_idx - 1] = 0
     ws.append(total_values)
     for col_idx in range(1, len(columns) + 1):
         cell = ws.cell(row=excel_row, column=col_idx)
